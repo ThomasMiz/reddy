@@ -23,6 +23,11 @@ async fn main() {
         .init();
 
     let env_variables = env_file_reader::read_file(".env").expect("Couldn't open .env file");
+
+    let listen_at_var = env_variables
+        .get("LISTEN_AT")
+        .expect("Couldn't find LISTEN_AT variable on .env file");
+
     let redis_host_var = env_variables
         .get("REDIS_HOSTS")
         .expect("Couldn't find REDIS_HOSTS variable on .env file");
@@ -69,7 +74,7 @@ async fn main() {
     let app = Router::new().route("/:key", get(get_key).post(set_key)).with_state(clients);
 
     // run it
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    let listener = tokio::net::TcpListener::bind(listen_at_var).await.unwrap();
     tracing::debug!("listening on {}", listener.local_addr().unwrap());
     axum::serve(listener, app).await.unwrap();
 }
