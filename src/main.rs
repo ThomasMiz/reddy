@@ -1,4 +1,4 @@
-use std::ops::Deref;
+use std::{ops::Deref, sync::Arc};
 
 use axum::{
     body::Bytes,
@@ -26,6 +26,11 @@ async fn main() {
     let listen_at_var = env_variables
         .get("LISTEN_AT")
         .expect("Couldn't find LISTEN_AT variable on .env file");
+
+    let instance_name = env_variables
+        .get("INSTANCE_NAME")
+        .expect("Couldn't find INSTANCE_NAME variable on .env file")
+        .clone();
 
     let redis_host_var = env_variables
         .get("REDIS_HOSTS")
@@ -69,8 +74,10 @@ async fn main() {
         clients.push(client);
     }
 
+    let state = Arc::new(SharedStateInner { instance_name, clients });
+
     // build our application with some routes
-    let app = Router::new().route("/:key", get(get_key).post(set_key)).with_state(clients);
+    let app = Router::new().route("/:key", get(get_key).post(set_key)).with_state(state);
 
     // run it
     let listener = tokio::net::TcpListener::bind(listen_at_var).await.unwrap();
@@ -78,12 +85,18 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-type ConnectionPool = Vec<redis::Client>;
+#[derive(Clone)]
+struct SharedStateInner {
+    instance_name: String,
+    clients: Vec<redis::Client>,
+}
 
-async fn get_key(Path(key): Path<String>, State(pool): State<ConnectionPool>) -> Response<String> {
-    let redis_instance_index = get_key_instance_index(&key, pool.len());
-    let client = &pool[redis_instance_index];
-    let response = Response::builder();
+type SharedState = Arc<SharedStateInner>;
+
+async fn get_key(Path(key): Path<String>, State(state): State<SharedState>) -> Response<String> {
+    let redis_instance_index = get_key_instance_index(&key, state.clients.len());
+    let client = &state.clients[redis_instance_index];
+    let response = Response::builder().header("X-Reddy-Instance-Name", state.instance_name.clone());
 
     let response_result = match client.get_multiplexed_async_connection().await {
         Err(err) => response
@@ -111,10 +124,10 @@ async fn get_key(Path(key): Path<String>, State(pool): State<ConnectionPool>) ->
     }
 }
 
-async fn set_key(Path(key): Path<String>, State(pool): State<ConnectionPool>, bytes: Bytes) -> Response<String> {
-    let redis_instance_index = get_key_instance_index(&key, pool.len());
-    let client = &pool[redis_instance_index];
-    let response = Response::builder();
+async fn set_key(Path(key): Path<String>, State(state): State<SharedState>, bytes: Bytes) -> Response<String> {
+    let redis_instance_index = get_key_instance_index(&key, state.clients.len());
+    let client = &state.clients[redis_instance_index];
+    let response = Response::builder().header("X-Reddy-Instance-Name", state.instance_name.clone());
 
     let response_result = match client.get_multiplexed_async_connection().await {
         Err(err) => response
