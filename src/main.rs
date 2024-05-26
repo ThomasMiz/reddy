@@ -3,8 +3,7 @@ use std::ops::Deref;
 use axum::{
     body::Bytes,
     extract::{Path, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::{Response, StatusCode},
     routing::get,
     Router,
 };
@@ -81,44 +80,64 @@ async fn main() {
 
 type ConnectionPool = Vec<redis::Client>;
 
-async fn get_key(Path(key): Path<String>, State(pool): State<ConnectionPool>) -> impl IntoResponse {
-    let client = &pool[get_key_instance_index(&key, pool.len())];
+async fn get_key(Path(key): Path<String>, State(pool): State<ConnectionPool>) -> Response<String> {
+    let redis_instance_index = get_key_instance_index(&key, pool.len());
+    let client = &pool[redis_instance_index];
+    let response = Response::builder();
 
-    let mut conn = client
-        .get_multiplexed_async_connection()
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("Could not connect to Redis: {err}")))?;
+    let response_result = match client.get_multiplexed_async_connection().await {
+        Err(err) => response
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(format!("Could not connect to Redis: {err}")),
+        Ok(mut conn) => {
+            let response = response.header("X-Redis-Instance-Index", redis_instance_index);
 
-    let result: String = match conn.get(key).await {
-        Ok(s) => s,
-        Err(err) if err.kind() == redis::ErrorKind::TypeError => return Err((StatusCode::NOT_FOUND, String::new())),
-        Err(err) => return Err(internal_error(err)),
+            match conn.get(key).await {
+                Ok(s) => response.status(StatusCode::OK).body(s),
+                Err(err) if err.kind() == redis::ErrorKind::TypeError => response.status(StatusCode::NOT_FOUND).body(String::new()),
+                Err(err) => response
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(format!("Error during request to Redis: {err}")),
+            }
+        }
     };
 
-    Ok(result)
+    match response_result {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::error!("Failed to construct error response: {err}");
+            Response::new(String::from("Unexpected internal server error"))
+        }
+    }
 }
 
-async fn set_key(Path(key): Path<String>, State(pool): State<ConnectionPool>, bytes: Bytes) -> Result<String, (StatusCode, String)> {
-    let client = &pool[get_key_instance_index(&key, pool.len())];
+async fn set_key(Path(key): Path<String>, State(pool): State<ConnectionPool>, bytes: Bytes) -> Response<String> {
+    let redis_instance_index = get_key_instance_index(&key, pool.len());
+    let client = &pool[redis_instance_index];
+    let response = Response::builder();
 
-    let mut conn = client
-        .get_multiplexed_async_connection()
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("Could not connect to Redis: {err}")))?;
+    let response_result = match client.get_multiplexed_async_connection().await {
+        Err(err) => response
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(format!("Could not connect to Redis: {err}")),
+        Ok(mut conn) => {
+            let response = response.header("X-Redis-Instance-Index", redis_instance_index);
 
-    let result: String = match conn.set(key, bytes.deref()).await {
-        Ok(s) => s,
-        Err(err) if err.kind() == redis::ErrorKind::TypeError => return Err((StatusCode::NOT_FOUND, String::new())),
-        Err(err) => return Err(internal_error(err)),
+            match conn.set(key, bytes.deref()).await {
+                Ok(s) => response.status(StatusCode::OK).body(s),
+                Err(err) if err.kind() == redis::ErrorKind::TypeError => response.status(StatusCode::NOT_FOUND).body(String::new()),
+                Err(err) => response
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(format!("Error during request to Redis: {err}")),
+            }
+        }
     };
 
-    Ok(result)
-}
-
-/// Utility function for mapping any error into a `500 Internal Server Error` response.
-fn internal_error<E>(err: E) -> (StatusCode, String)
-where
-    E: std::error::Error,
-{
-    (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+    match response_result {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::error!("Failed to construct error response: {err}");
+            Response::new(String::from("Unexpected internal server error"))
+        }
+    }
 }
