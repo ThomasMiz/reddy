@@ -4,50 +4,69 @@ use axum::{
     body::Bytes,
     extract::{Path, State},
     http::StatusCode,
+    response::IntoResponse,
     routing::get,
     Router,
 };
 
-use redis::{cluster::ClusterClient, AsyncCommands};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use redis::AsyncCommands;
+use tracing_subscriber::{filter, layer::SubscriberExt, util::SubscriberInitExt, Layer};
+
+fn get_key_instance_index(key: &str, redis_instance_count: usize) -> usize {
+    return key.bytes().map(|b| b as usize).sum::<usize>() % redis_instance_count;
+}
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "example_tokio_redis=debug".into()))
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_filter(filter::LevelFilter::DEBUG))
         .init();
 
     let env_variables = env_file_reader::read_file(".env").expect("Couldn't open .env file");
     let redis_host_var = env_variables
-        .get("REDIS_HOST")
-        .expect("Couldn't find REDIS_HOST variable on .env file");
-    tracing::debug!("connecting to redis nodes at {}", redis_host_var);
+        .get("REDIS_HOSTS")
+        .expect("Couldn't find REDIS_HOSTS variable on .env file");
+    tracing::debug!("Connecting to Redis nodes at {}", redis_host_var);
 
-    let redis_hosts = redis_host_var.split(';').map(|s| s.trim());
-    let cluster_client = match ClusterClient::new(redis_hosts) {
-        Ok(cc) => cc,
-        Err(error) => panic!("Couldn't connect to redis hosts at {redis_host_var}: {error}"),
-    };
+    let mut clients = Vec::new();
+    for host in redis_host_var.split(';').map(|s| s.trim()) {
+        let client = match redis::Client::open(host) {
+            Ok(h) => h,
+            Err(err) => panic!("Invalid Redis host format on \"{host}\": {err}"),
+        };
 
-    {
-        let mut conn = match cluster_client.get_async_connection().await {
+        let mut conn = match client.get_multiplexed_tokio_connection().await {
             Ok(c) => c,
-            Err(error) => panic!("Couldn't connect to redis for pinging: {error}"),
+            Err(err) => {
+                tracing::error!("Could not connect to Redis instance at {host}: {err}");
+                continue;
+            }
         };
 
-        let s: String = match conn.set("Hello", "World").await {
+        tracing::debug!("Setting test key on host {host}");
+        let _: String = match conn.set("test", "test").await {
             Ok(s) => s,
-            Err(error) => panic!("Couldn't set key-value \"Hello: World\" in redis: {error}"),
+            Err(err) => {
+                tracing::error!("Could not SET test key on redis host {host}: {err}");
+                continue;
+            }
         };
 
-        tracing::debug!("set hey \"Hello\" to value \"World\" in redis: {s}");
+        tracing::debug!("Getting test key on host {host}");
+        let _: String = match conn.get("test").await {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::error!("Could SET but not GET test key on redis host {host}: {err}");
+                continue;
+            }
+        };
+
+        tracing::info!("Redis host {host} working properly");
+        clients.push(client);
     }
 
-    tracing::debug!("successfully connected to redis and pinged it");
-
     // build our application with some routes
-    let app = Router::new().route("/:key", get(get_key).post(set_key)).with_state(cluster_client);
+    let app = Router::new().route("/:key", get(get_key).post(set_key)).with_state(clients);
 
     // run it
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
@@ -55,10 +74,16 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-type ConnectionPool = ClusterClient;
+type ConnectionPool = Vec<redis::Client>;
 
-async fn get_key(Path(key): Path<String>, State(pool): State<ConnectionPool>) -> Result<String, (StatusCode, String)> {
-    let mut conn = pool.get_async_connection().await.map_err(internal_error)?;
+async fn get_key(Path(key): Path<String>, State(pool): State<ConnectionPool>) -> impl IntoResponse {
+    let client = &pool[get_key_instance_index(&key, pool.len())];
+
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("Could not connect to Redis: {err}")))?;
+
     let result: String = match conn.get(key).await {
         Ok(s) => s,
         Err(err) if err.kind() == redis::ErrorKind::TypeError => return Err((StatusCode::NOT_FOUND, String::new())),
@@ -69,7 +94,13 @@ async fn get_key(Path(key): Path<String>, State(pool): State<ConnectionPool>) ->
 }
 
 async fn set_key(Path(key): Path<String>, State(pool): State<ConnectionPool>, bytes: Bytes) -> Result<String, (StatusCode, String)> {
-    let mut conn = pool.get_async_connection().await.map_err(internal_error)?;
+    let client = &pool[get_key_instance_index(&key, pool.len())];
+
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("Could not connect to Redis: {err}")))?;
+
     let result: String = match conn.set(key, bytes.deref()).await {
         Ok(s) => s,
         Err(err) if err.kind() == redis::ErrorKind::TypeError => return Err((StatusCode::NOT_FOUND, String::new())),
